@@ -13,7 +13,9 @@ import android.media.MediaMuxer
 import android.net.Uri
 import android.os.Bundle
 import android.provider.MediaStore
+import android.util.Rational
 import android.util.Size
+import android.view.Surface
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.ScaleGestureDetector
@@ -34,6 +36,11 @@ import androidx.camera.core.ImageCapture
 import androidx.camera.core.ImageCaptureException
 import androidx.camera.core.ImageProxy
 import androidx.camera.core.Preview
+import androidx.camera.core.UseCaseGroup
+import androidx.camera.core.ViewPort
+import androidx.camera.core.resolutionselector.AspectRatioStrategy
+import androidx.camera.core.resolutionselector.ResolutionSelector
+import androidx.camera.core.resolutionselector.ResolutionStrategy
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.core.content.ContextCompat
@@ -63,6 +70,9 @@ class MainActivity : ComponentActivity() {
     private lateinit var liveBadge: TextView
     private lateinit var flashBtn: TextView
     private lateinit var mp4Btn: TextView
+    private lateinit var ratioBtn: TextView
+    private var ratioIdx = 3
+    private val ratioNames = arrayOf("4:3", "16:9", "1:1", "Penuh")
     private lateinit var thumbView: ImageView
     private lateinit var focusRing: View
     private var camera: Camera? = null
@@ -91,6 +101,7 @@ class MainActivity : ComponentActivity() {
         stillFile = File(cacheDir, "still.jpg")
         val prefs = getSharedPreferences("p", 0)
         saveMp4 = prefs.getBoolean("mp4", true)
+        ratioIdx = prefs.getInt("ratio", 3)
 
         previewView = PreviewView(this)
         liveBadge = chip("● LIVE").apply { setTextColor(yellow) }
@@ -104,7 +115,10 @@ class MainActivity : ComponentActivity() {
         mp4Btn = chip("").apply {
             setOnClickListener { saveMp4 = !saveMp4; prefs.edit().putBoolean("mp4", saveMp4).apply(); updateMp4() }
         }
-        updateMp4()
+        ratioBtn = chip("").apply {
+            setOnClickListener { ratioIdx = (ratioIdx + 1) % 4; prefs.edit().putInt("ratio", ratioIdx).apply(); updateRatio(); startCamera() }
+        }
+        updateMp4(); updateRatio()
         thumbView = ImageView(this).apply {
             scaleType = ImageView.ScaleType.CENTER_CROP
             background = oval(0x44FFFFFF, Color.WHITE, dp(2))
@@ -123,6 +137,7 @@ class MainActivity : ComponentActivity() {
         val top = LinearLayout(this).apply {
             gravity = Gravity.CENTER_VERTICAL
             addView(flashBtn)
+            addView(ratioBtn, LinearLayout.LayoutParams(-2, -2).apply { marginStart = dp(8) })
             addView(View(this@MainActivity), LinearLayout.LayoutParams(0, 1, 1f))
             addView(liveBadge)
             addView(View(this@MainActivity), LinearLayout.LayoutParams(0, 1, 1f))
@@ -166,6 +181,8 @@ class MainActivity : ComponentActivity() {
         runOnUiThread { if (bm != null) thumbView.setImageBitmap(bm) }
     }
 
+    private fun updateRatio() { ratioBtn.text = "▭ " + ratioNames[ratioIdx] }
+
     private fun updateMp4() { mp4Btn.text = if (saveMp4) "🎞 MP4: ON" else "🎞 MP4: OFF" }
 
     private fun cycleFlash() {
@@ -194,20 +211,30 @@ class MainActivity : ComponentActivity() {
             val provider = future.get()
             val sel = CameraSelector.Builder().requireLensFacing(lens).build()
             if (!provider.hasCamera(sel)) { toast("Kamera tidak tersedia"); return@addListener }
-            val preview = Preview.Builder().build().also { it.setSurfaceProvider(previewView.surfaceProvider) }
-            imageCapture = ImageCapture.Builder().setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY).setFlashMode(flashMode).build()
-            val analysis = ImageAnalysis.Builder()
-                .setTargetResolution(Size(480, 640))
+            val wide = ratioIdx == 1 || ratioIdx == 3
+            val strat = if (wide) AspectRatioStrategy.RATIO_16_9_FALLBACK_AUTO_STRATEGY else AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY
+            val rs = ResolutionSelector.Builder().setAspectRatioStrategy(strat).build()
+            val rsAnalysis = ResolutionSelector.Builder().setAspectRatioStrategy(strat)
+                .setResolutionStrategy(ResolutionStrategy(if (wide) Size(640, 360) else Size(640, 480), ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER)).build()
+            val preview = Preview.Builder().setResolutionSelector(rs).build().also { it.setSurfaceProvider(previewView.surfaceProvider) }
+            imageCapture = ImageCapture.Builder().setResolutionSelector(rs).setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY).setFlashMode(flashMode).build()
+            val analysis = ImageAnalysis.Builder().setResolutionSelector(rsAnalysis)
                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                 .build().also { it.setAnalyzer(camExec, ::onFrame) }
+            val pw = if (previewView.width > 0) previewView.width else resources.displayMetrics.widthPixels
+            val ph = if (previewView.height > 0) previewView.height else resources.displayMetrics.heightPixels
+            val ratio = when (ratioIdx) { 0 -> Rational(3, 4); 1 -> Rational(9, 16); 2 -> Rational(1, 1); else -> Rational(pw, ph) }
+            previewView.scaleType = if (ratioIdx == 3) PreviewView.ScaleType.FILL_CENTER else PreviewView.ScaleType.FIT_CENTER
+            val vp = ViewPort.Builder(ratio, previewView.display?.rotation ?: Surface.ROTATION_0).setScaleType(ViewPort.FILL_CENTER).build()
+            val group = UseCaseGroup.Builder().setViewPort(vp).addUseCase(preview).addUseCase(imageCapture).addUseCase(analysis).build()
             synchronized(lock) { ring.clear() }
             provider.unbindAll()
-            camera = provider.bindToLifecycle(this, sel, preview, imageCapture, analysis)
+            camera = provider.bindToLifecycle(this, sel, group)
         }, ContextCompat.getMainExecutor(this))
     }
 
     private fun onFrame(img: ImageProxy) {
-        val f = Frame(toNv12(img), img.width, img.height, img.imageInfo.timestamp)
+        val f = toFrame(img)
         rotation = img.imageInfo.rotationDegrees
         img.close()
         synchronized(lock) {
@@ -257,16 +284,26 @@ class MainActivity : ComponentActivity() {
 
     private fun reset(msg: String) = runOnUiThread { toast(msg); shutter.isEnabled = true; liveBadge.text = "● LIVE"; liveBadge.setTextColor(yellow) }
 
-    private fun toNv12(img: ImageProxy): ByteArray {
-        val w = img.width; val h = img.height
+    private fun toFrame(img: ImageProxy): Frame {
+        val cr = img.cropRect
+        val l = cr.left and 1.inv(); val t = cr.top and 1.inv()
+        val w = cr.width() and 15.inv(); val h = cr.height() and 15.inv()
         val out = ByteArray(w * h * 3 / 2); var p = 0
         val y = img.planes[0]; val u = img.planes[1]; val v = img.planes[2]
-        for (r in 0 until h) { val b = r * y.rowStride; for (c in 0 until w) out[p++] = y.buffer.get(b + c * y.pixelStride) }
-        for (r in 0 until h / 2) for (c in 0 until w / 2) {
+        for (r in t until t + h) { val b = r * y.rowStride; for (c in l until l + w) out[p++] = y.buffer.get(b + c * y.pixelStride) }
+        for (r in t / 2 until (t + h) / 2) for (c in l / 2 until (l + w) / 2) {
             out[p++] = u.buffer.get(r * u.rowStride + c * u.pixelStride)
             out[p++] = v.buffer.get(r * v.rowStride + c * v.pixelStride)
         }
-        return out
+        return Frame(out, w, h, img.imageInfo.timestamp)
+    }
+
+    private fun pad(f: Frame, stride: Int, sh: Int): ByteArray {
+        val o = ByteArray(stride * sh * 3 / 2)
+        for (r in 0 until f.h) System.arraycopy(f.nv12, r * f.w, o, r * stride, f.w)
+        val src = f.w * f.h; val dst = stride * sh
+        for (r in 0 until f.h / 2) System.arraycopy(f.nv12, src + r * f.w, o, dst + r * stride, f.w)
+        return o
     }
 
     private fun encode(frames: List<Frame>, out: File, rot: Int) {
@@ -278,6 +315,9 @@ class MainActivity : ComponentActivity() {
         }
         val codec = MediaCodec.createEncoderByType("video/avc")
         codec.configure(fmt, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE); codec.start()
+        val inF = codec.inputFormat
+        val stride = if (inF.containsKey(MediaFormat.KEY_STRIDE)) inF.getInteger(MediaFormat.KEY_STRIDE) else frames[0].w
+        val sh = if (inF.containsKey(MediaFormat.KEY_SLICE_HEIGHT)) inF.getInteger(MediaFormat.KEY_SLICE_HEIGHT) else frames[0].h
         out.delete()
         val mux = MediaMuxer(out.path, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4).apply { setOrientationHint(rot) }
         var track = -1; var started = false
@@ -302,8 +342,9 @@ class MainActivity : ComponentActivity() {
         val t0 = frames[0].tsNs
         for (f in frames) {
             val i = nextInput()
-            codec.getInputBuffer(i)!!.apply { clear(); put(f.nv12) }
-            codec.queueInputBuffer(i, 0, f.nv12.size, (f.tsNs - t0) / 1000, 0)
+            val data = if (stride == f.w && sh == f.h) f.nv12 else pad(f, stride, sh)
+            codec.getInputBuffer(i)!!.apply { clear(); put(data) }
+            codec.queueInputBuffer(i, 0, data.size, (f.tsNs - t0) / 1000, 0)
             drain(false)
         }
         codec.queueInputBuffer(nextInput(), 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
