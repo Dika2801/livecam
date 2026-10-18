@@ -63,7 +63,7 @@ class Frame(val nv12: ByteArray, val w: Int, val h: Int, val tsNs: Long)
 class Stab(val cw: Int, val ch: Int, val ox: IntArray, val oy: IntArray)
 
 class MainActivity : ComponentActivity() {
-    private val windowNs = 1_500_000_000L
+    private val windowNs = 1_200_000_000L
     private val yellow = Color.parseColor("#FFD60A")
     private val lock = Any()
     private val ring = ArrayDeque<Frame>()
@@ -273,10 +273,10 @@ class MainActivity : ComponentActivity() {
             val wide = ratioIdx == 1 || ratioIdx == 3
             val strat = if (wide) AspectRatioStrategy.RATIO_16_9_FALLBACK_AUTO_STRATEGY else AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY
             val rs = ResolutionSelector.Builder().setAspectRatioStrategy(strat).build()
-            val sz = if (wide) (if (hd) Size(1280, 720) else Size(640, 360)) else (if (hd) Size(960, 720) else Size(640, 480))
+            val sz = if (wide) (if (hd) Size(960, 540) else Size(640, 360)) else (if (hd) Size(800, 600) else Size(640, 480))
             val rsAnalysis = ResolutionSelector.Builder().setAspectRatioStrategy(strat)
                 .setResolutionStrategy(ResolutionStrategy(sz, ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER)).build()
-            val capSize = if (wide) Size(3840, 2160) else Size(3264, 2448)
+            val capSize = if (wide) Size(2560, 1440) else Size(2592, 1944)
             val rsCap = ResolutionSelector.Builder().setAspectRatioStrategy(strat)
                 .setResolutionStrategy(ResolutionStrategy(capSize, ResolutionStrategy.FALLBACK_RULE_CLOSEST_LOWER_THEN_HIGHER)).build()
             val pb = Preview.Builder().setResolutionSelector(rs)
@@ -305,9 +305,10 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun onFrame(img: ImageProxy) {
-        val f = toFrame(img)
+        val f = try { toFrame(img) } catch (t: Throwable) { null }
         rotation = img.imageInfo.rotationDegrees
         img.close()
+        if (f == null) return
         synchronized(lock) {
             ring.addLast(f)
             while (ring.size > 1 && f.tsNs - ring.first().tsNs > windowNs) ring.removeFirst()
@@ -325,20 +326,28 @@ class MainActivity : ComponentActivity() {
         }
         shutter.isEnabled = false
         inner.animate().scaleX(0.82f).scaleY(0.82f).setDuration(90).withEndAction { inner.animate().scaleX(1f).scaleY(1f).setDuration(90).start() }.start()
-        badge("● TAHAN…", Color.parseColor("#FF453A"))
+        val red = Color.parseColor("#FF453A")
+        val fileShot = {
+            imageCapture.takePicture(ImageCapture.OutputFileOptions.Builder(stillFile).build(), camExec,
+                object : ImageCapture.OnImageSavedCallback {
+                    override fun onImageSaved(r: ImageCapture.OutputFileResults) { synchronized(lock) { stillOk = true; maybeFinish() } }
+                    override fun onError(e: ImageCaptureException) { synchronized(lock) { post = null }; reset("Gagal memotret") }
+                })
+        }
         if (night || hd) {
-            badge(if (night) "● TAHAN 6 DETIK" else "● TAHAN 2 DETIK", Color.parseColor("#FF453A"))
+            badge(if (night) "● TAHAN 6 DETIK" else "● TAHAN 2 DETIK", red)
             nightExec.execute {
-                val ok = try { stackShots(if (night) 6 else 3, night, stillFile) } catch (e: Throwable) { false }
+                var err: String? = null
+                val ok = try { stackShots(if (night) 6 else 3, night, stillFile) }
+                catch (t: Throwable) { err = t.javaClass.simpleName + " " + (t.message ?: "").take(50); false }
                 if (ok) synchronized(lock) { stillOk = true; maybeFinish() }
-                else { synchronized(lock) { post = null }; reset("Gagal memproses foto") }
+                else {
+                    runOnUiThread { toast("Mode lanjutan gagal (" + (err ?: "foto tidak terambil") + "), memakai foto biasa") }
+                    badge("● TAHAN…", red)
+                    fileShot()
+                }
             }
-        } else
-        imageCapture.takePicture(ImageCapture.OutputFileOptions.Builder(stillFile).build(), camExec,
-            object : ImageCapture.OnImageSavedCallback {
-                override fun onImageSaved(r: ImageCapture.OutputFileResults) { synchronized(lock) { stillOk = true; maybeFinish() } }
-                override fun onError(e: ImageCaptureException) { synchronized(lock) { post = null }; reset("Gagal memotret") }
-            })
+        } else { badge("● TAHAN…", red); fileShot() }
     }
 
     private fun maybeFinish() {
@@ -357,7 +366,7 @@ class MainActivity : ComponentActivity() {
                 if (saveMp4) saveVideo(mp4, ts)
                 refreshThumb()
                 reset("Tersimpan di Pictures/LiveCam")
-            } catch (e: Exception) { reset("Gagal: ${e.message}") }
+            } catch (t: Throwable) { reset("Gagal: " + t.javaClass.simpleName + " " + (t.message ?: "").take(50)) }
         }
     }
 
@@ -440,25 +449,27 @@ class MainActivity : ComponentActivity() {
         val n = fr.size
         val mx = (w * 0.08).toInt(); val my = (h * 0.08).toInt()
         val cw = (w - 2 * mx) and 15.inv(); val ch = (h - 2 * my) and 15.inv()
-        val c8 = fr.map { yDown(it, 8) }; val c2 = fr.map { yDown(it, 2) }
+        var p8 = yDown(fr[0], 8); var p2 = yDown(fr[0], 2)
         val w8 = w / 8; val h8 = h / 8; val w2 = w / 2; val h2 = h / 2
         val px = DoubleArray(n); val py = DoubleArray(n)
         for (i in 1 until n) {
+            val q8 = yDown(fr[i], 8); val q2 = yDown(fr[i], 2)
             var best = Long.MAX_VALUE; var bx = 0; var by = 0
             for (dy in -4..4) for (dx in -4..4) {
-                val s = sad(c8[i - 1], c8[i], w8, h8, dx, dy, 1, 5)
+                val s = sad(p8, q8, w8, h8, dx, dy, 1, 5)
                 if (s < best) { best = s; bx = dx; by = dy }
             }
             val cx = bx * 4; val cy = by * 4
             var bs = Long.MAX_VALUE; var rx = cx; var ry = cy
             for (dy in -3..3) for (dx in -3..3) {
-                val s = sad(c2[i - 1], c2[i], w2, h2, cx + dx, cy + dy, 2, 21)
+                val s = sad(p2, q2, w2, h2, cx + dx, cy + dy, 2, 21)
                 if (s < bs) { bs = s; rx = cx + dx; ry = cy + dy }
             }
             val s0 = bs.toDouble()
-            val fx = parab(sad(c2[i - 1], c2[i], w2, h2, rx - 1, ry, 2, 21).toDouble(), s0, sad(c2[i - 1], c2[i], w2, h2, rx + 1, ry, 2, 21).toDouble())
-            val fy = parab(sad(c2[i - 1], c2[i], w2, h2, rx, ry - 1, 2, 21).toDouble(), s0, sad(c2[i - 1], c2[i], w2, h2, rx, ry + 1, 2, 21).toDouble())
+            val fx = parab(sad(p2, q2, w2, h2, rx - 1, ry, 2, 21).toDouble(), s0, sad(p2, q2, w2, h2, rx + 1, ry, 2, 21).toDouble())
+            val fy = parab(sad(p2, q2, w2, h2, rx, ry - 1, 2, 21).toDouble(), s0, sad(p2, q2, w2, h2, rx, ry + 1, 2, 21).toDouble())
             px[i] = px[i - 1] + (rx + fx) * 2; py[i] = py[i - 1] + (ry + fy) * 2
+            p8 = q8; p2 = q2
         }
         val rad = 10
         val ox = IntArray(n); val oy = IntArray(n)
@@ -502,7 +513,7 @@ class MainActivity : ComponentActivity() {
         val bo = BitmapFactory.Options().apply { inJustDecodeBounds = true }
         BitmapFactory.decodeByteArray(s.jpeg, 0, s.jpeg.size, bo)
         var sample = 1
-        while ((bo.outWidth / sample) * (bo.outHeight / sample) > 9_000_000) sample *= 2
+        while ((bo.outWidth / sample) * (bo.outHeight / sample) > 6_000_000) sample *= 2
         val full = BitmapFactory.decodeByteArray(s.jpeg, 0, s.jpeg.size, BitmapFactory.Options().apply { inSampleSize = sample }) ?: return null
         val l = (s.cl / sample).coerceIn(0, full.width - 2); val t = (s.ct / sample).coerceIn(0, full.height - 2)
         val cw = minOf(s.cw / sample, full.width - l); val ch = minOf(s.ch / sample, full.height - t)
@@ -694,7 +705,8 @@ class MainActivity : ComponentActivity() {
             o[i] = (0xFF shl 24) or ((sr[i] / c) shl 16) or ((sg[i] / c) shl 8) or (sb[i] / c)
         }
         enhance(o, w, h, night)
-        val res = Bitmap.createBitmap(o, w, h, Bitmap.Config.ARGB_8888)
+        val res = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        res.setPixels(o, 0, w, 0, 0, w, h)
         out.outputStream().use { res.compress(Bitmap.CompressFormat.JPEG, 97, it) }
         return true
     }
