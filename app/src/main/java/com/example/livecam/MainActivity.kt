@@ -4,7 +4,12 @@ import android.Manifest
 import android.content.ContentValues
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.graphics.Color
+import android.graphics.Matrix
+import android.hardware.camera2.CameraCharacteristics
+import android.hardware.camera2.CaptureRequest
 import android.graphics.drawable.GradientDrawable
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
@@ -28,7 +33,12 @@ import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.camera.camera2.interop.Camera2CameraInfo
+import androidx.camera.camera2.interop.Camera2Interop
+import androidx.camera.camera2.interop.ExperimentalCamera2Interop
 import androidx.camera.core.Camera
+import androidx.camera.core.CameraInfo
+import androidx.camera.core.ExtendableBuilder
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.FocusMeteringAction
 import androidx.camera.core.ImageAnalysis
@@ -45,9 +55,12 @@ import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.core.content.ContextCompat
 import java.io.File
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 
 class Frame(val nv12: ByteArray, val w: Int, val h: Int, val tsNs: Long)
+class Stab(val cw: Int, val ch: Int, val ox: IntArray, val oy: IntArray)
 
 class MainActivity : ComponentActivity() {
     private val windowNs = 1_500_000_000L
@@ -71,6 +84,14 @@ class MainActivity : ComponentActivity() {
     private lateinit var flashBtn: TextView
     private lateinit var mp4Btn: TextView
     private lateinit var ratioBtn: TextView
+    private lateinit var hdBtn: TextView
+    private lateinit var stabBtn: TextView
+    private lateinit var nightBtn: TextView
+    private var hd = true
+    private var stab = true
+    private var night = false
+    private val capExec = Executors.newSingleThreadExecutor()
+    private val nightExec = Executors.newSingleThreadExecutor()
     private var ratioIdx = 3
     private val ratioNames = arrayOf("4:3", "16:9", "1:1", "Penuh")
     private lateinit var thumbView: ImageView
@@ -102,6 +123,8 @@ class MainActivity : ComponentActivity() {
         val prefs = getSharedPreferences("p", 0)
         saveMp4 = prefs.getBoolean("mp4", true)
         ratioIdx = prefs.getInt("ratio", 3)
+        hd = prefs.getBoolean("hd", true)
+        stab = prefs.getBoolean("stab", true)
 
         previewView = PreviewView(this)
         liveBadge = chip("● LIVE").apply { setTextColor(yellow) }
@@ -118,7 +141,10 @@ class MainActivity : ComponentActivity() {
         ratioBtn = chip("").apply {
             setOnClickListener { ratioIdx = (ratioIdx + 1) % 4; prefs.edit().putInt("ratio", ratioIdx).apply(); updateRatio(); startCamera() }
         }
-        updateMp4(); updateRatio()
+        hdBtn = chip("").apply { setOnClickListener { hd = !hd; prefs.edit().putBoolean("hd", hd).apply(); updateChips(); startCamera() } }
+        stabBtn = chip("").apply { setOnClickListener { stab = !stab; prefs.edit().putBoolean("stab", stab).apply(); updateChips(); startCamera() } }
+        nightBtn = chip("").apply { setOnClickListener { night = !night; updateChips(); startCamera() } }
+        updateMp4(); updateRatio(); updateChips()
         thumbView = ImageView(this).apply {
             scaleType = ImageView.ScaleType.CENTER_CROP
             background = oval(0x44FFFFFF, Color.WHITE, dp(2))
@@ -148,6 +174,12 @@ class MainActivity : ComponentActivity() {
             addView(previewView, FrameLayout.LayoutParams(-1, -1))
             addView(focusRing, FrameLayout.LayoutParams(dp(70), dp(70)))
             addView(top, FrameLayout.LayoutParams(-1, -2, Gravity.TOP).apply { topMargin = dp(40); marginStart = dp(16); marginEnd = dp(16) })
+            addView(LinearLayout(this@MainActivity).apply {
+                gravity = Gravity.CENTER
+                addView(hdBtn)
+                addView(stabBtn, LinearLayout.LayoutParams(-2, -2).apply { marginStart = dp(8) })
+                addView(nightBtn, LinearLayout.LayoutParams(-2, -2).apply { marginStart = dp(8) })
+            }, FrameLayout.LayoutParams(-1, -2, Gravity.TOP).apply { topMargin = dp(90) })
             addView(thumbView, FrameLayout.LayoutParams(dp(56), dp(56), Gravity.BOTTOM or Gravity.START).apply { marginStart = dp(32); bottomMargin = dp(55) })
             addView(shutter, FrameLayout.LayoutParams(dp(78), dp(78), Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL).apply { bottomMargin = dp(44) })
             addView(mp4Btn, FrameLayout.LayoutParams(-2, -2, Gravity.BOTTOM or Gravity.END).apply { marginEnd = dp(24); bottomMargin = dp(60) })
@@ -181,6 +213,32 @@ class MainActivity : ComponentActivity() {
         runOnUiThread { if (bm != null) thumbView.setImageBitmap(bm) }
     }
 
+    private fun setOn(tv: TextView, on: Boolean, label: String) { tv.text = label; tv.setTextColor(if (on) yellow else Color.WHITE) }
+    private fun updateChips() {
+        setOn(hdBtn, hd, if (hd) "HD: ON" else "HD: OFF")
+        setOn(stabBtn, stab, if (stab) "Stabil: ON" else "Stabil: OFF")
+        setOn(nightBtn, night, if (night) "🌙 Malam: ON" else "🌙 Malam: OFF")
+    }
+
+    @androidx.annotation.OptIn(ExperimentalCamera2Interop::class)
+    @kotlin.OptIn(ExperimentalCamera2Interop::class)
+    private fun <T> tune(b: ExtendableBuilder<T>, info: CameraInfo) {
+        val ci = Camera2CameraInfo.from(info)
+        val ext = Camera2Interop.Extender(b)
+        fun has(k: CameraCharacteristics.Key<IntArray>, v: Int) = ci.getCameraCharacteristic(k)?.contains(v) == true
+        if (has(CameraCharacteristics.NOISE_REDUCTION_AVAILABLE_NOISE_REDUCTION_MODES, CaptureRequest.NOISE_REDUCTION_MODE_HIGH_QUALITY))
+            ext.setCaptureRequestOption(CaptureRequest.NOISE_REDUCTION_MODE, CaptureRequest.NOISE_REDUCTION_MODE_HIGH_QUALITY)
+        if (has(CameraCharacteristics.EDGE_AVAILABLE_EDGE_MODES, CaptureRequest.EDGE_MODE_HIGH_QUALITY))
+            ext.setCaptureRequestOption(CaptureRequest.EDGE_MODE, CaptureRequest.EDGE_MODE_HIGH_QUALITY)
+        if (stab && has(CameraCharacteristics.LENS_INFO_AVAILABLE_OPTICAL_STABILIZATION, CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE_ON))
+            ext.setCaptureRequestOption(CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE, CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE_ON)
+        if (night) {
+            val r = ci.getCameraCharacteristic(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)
+            val pick = r?.filter { it.lower in 8..15 }?.minByOrNull { it.lower } ?: r?.minByOrNull { it.lower }
+            if (pick != null) ext.setCaptureRequestOption(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, pick)
+        }
+    }
+
     private fun updateRatio() { ratioBtn.text = "▭ " + ratioNames[ratioIdx] }
 
     private fun updateMp4() { mp4Btn.text = if (saveMp4) "🎞 MP4: ON" else "🎞 MP4: OFF" }
@@ -211,16 +269,22 @@ class MainActivity : ComponentActivity() {
             val provider = future.get()
             val sel = CameraSelector.Builder().requireLensFacing(lens).build()
             if (!provider.hasCamera(sel)) { toast("Kamera tidak tersedia"); return@addListener }
+            val info = sel.filter(provider.availableCameraInfos).firstOrNull()
             val wide = ratioIdx == 1 || ratioIdx == 3
             val strat = if (wide) AspectRatioStrategy.RATIO_16_9_FALLBACK_AUTO_STRATEGY else AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY
             val rs = ResolutionSelector.Builder().setAspectRatioStrategy(strat).build()
+            val sz = if (wide) (if (hd) Size(1280, 720) else Size(640, 360)) else (if (hd) Size(960, 720) else Size(640, 480))
             val rsAnalysis = ResolutionSelector.Builder().setAspectRatioStrategy(strat)
-                .setResolutionStrategy(ResolutionStrategy(if (wide) Size(640, 360) else Size(640, 480), ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER)).build()
-            val preview = Preview.Builder().setResolutionSelector(rs).build().also { it.setSurfaceProvider(previewView.surfaceProvider) }
-            imageCapture = ImageCapture.Builder().setResolutionSelector(rs).setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY).setFlashMode(flashMode).build()
-            val analysis = ImageAnalysis.Builder().setResolutionSelector(rsAnalysis)
-                .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                .build().also { it.setAnalyzer(camExec, ::onFrame) }
+                .setResolutionStrategy(ResolutionStrategy(sz, ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER)).build()
+            val pb = Preview.Builder().setResolutionSelector(rs)
+            val icb = ImageCapture.Builder().setResolutionSelector(rs)
+                .setCaptureMode(if (hd || night) ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY else ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
+                .setFlashMode(flashMode)
+            val ab = ImageAnalysis.Builder().setResolutionSelector(rsAnalysis).setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+            if (info != null) { tune(pb, info); tune(icb, info); tune(ab, info) }
+            val preview = pb.build().also { it.setSurfaceProvider(previewView.surfaceProvider) }
+            imageCapture = icb.build()
+            val analysis = ab.build().also { it.setAnalyzer(camExec, ::onFrame) }
             val pw = if (previewView.width > 0) previewView.width else resources.displayMetrics.widthPixels
             val ph = if (previewView.height > 0) previewView.height else resources.displayMetrics.heightPixels
             val ratio = when (ratioIdx) { 0 -> Rational(3, 4); 1 -> Rational(9, 16); 2 -> Rational(1, 1); else -> Rational(pw, ph) }
@@ -230,6 +294,10 @@ class MainActivity : ComponentActivity() {
             synchronized(lock) { ring.clear() }
             provider.unbindAll()
             camera = provider.bindToLifecycle(this, sel, group)
+            camera?.let { c ->
+                val er = c.cameraInfo.exposureState.exposureCompensationRange
+                c.cameraControl.setExposureCompensationIndex(if (night && er.upper > 0) (er.upper * 2 + 2) / 3 else 0)
+            }
         }, ContextCompat.getMainExecutor(this))
     }
 
@@ -255,6 +323,14 @@ class MainActivity : ComponentActivity() {
         shutter.isEnabled = false
         inner.animate().scaleX(0.82f).scaleY(0.82f).setDuration(90).withEndAction { inner.animate().scaleX(1f).scaleY(1f).setDuration(90).start() }.start()
         badge("● TAHAN…", Color.parseColor("#FF453A"))
+        if (night) {
+            badge("● TAHAN 5 DETIK", Color.parseColor("#FF453A"))
+            nightExec.execute {
+                val ok = try { nightStack(6, stillFile) } catch (e: Throwable) { false }
+                if (ok) synchronized(lock) { stillOk = true; maybeFinish() }
+                else { synchronized(lock) { post = null }; reset("Gagal mode malam") }
+            }
+        } else
         imageCapture.takePicture(ImageCapture.OutputFileOptions.Builder(stillFile).build(), camExec,
             object : ImageCapture.OnImageSavedCallback {
                 override fun onImageSaved(r: ImageCapture.OutputFileResults) { synchronized(lock) { stillOk = true; maybeFinish() } }
@@ -272,7 +348,7 @@ class MainActivity : ComponentActivity() {
         ioExec.execute {
             try {
                 val mp4 = File(cacheDir, "clip.mp4")
-                encode(frames, mp4, rot)
+                encode(frames, mp4, rot, if (stab) stabPlan(frames) else null, hd)
                 val ts = System.currentTimeMillis()
                 saveMotionPhoto(stillFile, mp4, shutterTs / 1000, ts)
                 if (saveMp4) saveVideo(mp4, ts)
@@ -290,34 +366,199 @@ class MainActivity : ComponentActivity() {
         val w = cr.width() and 15.inv(); val h = cr.height() and 15.inv()
         val out = ByteArray(w * h * 3 / 2); var p = 0
         val y = img.planes[0]; val u = img.planes[1]; val v = img.planes[2]
-        for (r in t until t + h) { val b = r * y.rowStride; for (c in l until l + w) out[p++] = y.buffer.get(b + c * y.pixelStride) }
-        for (r in t / 2 until (t + h) / 2) for (c in l / 2 until (l + w) / 2) {
-            out[p++] = u.buffer.get(r * u.rowStride + c * u.pixelStride)
-            out[p++] = v.buffer.get(r * v.rowStride + c * v.pixelStride)
+        if (y.pixelStride == 1 && u.pixelStride == 2 && v.pixelStride == 2) {
+            val yb = y.buffer.duplicate(); val ub = u.buffer.duplicate(); val vb = v.buffer.duplicate()
+            for (r in t until t + h) { yb.position(r * y.rowStride + l); yb.get(out, p, w); p += w }
+            for (r in t / 2 until (t + h) / 2) {
+                val off = r * u.rowStride + l
+                val n = minOf(w, ub.limit() - off)
+                ub.position(off); ub.get(out, p, n)
+                if (n < w) out[p + w - 1] = vb.get(r * v.rowStride + l + w - 2)
+                p += w
+            }
+        } else {
+            for (r in t until t + h) { val b = r * y.rowStride; for (c in l until l + w) out[p++] = y.buffer.get(b + c * y.pixelStride) }
+            for (r in t / 2 until (t + h) / 2) for (c in l / 2 until (l + w) / 2) {
+                out[p++] = u.buffer.get(r * u.rowStride + c * u.pixelStride)
+                out[p++] = v.buffer.get(r * v.rowStride + c * v.pixelStride)
+            }
         }
         return Frame(out, w, h, img.imageInfo.timestamp)
     }
 
-    private fun pad(f: Frame, stride: Int, sh: Int): ByteArray {
+    private fun pad(raw: ByteArray, w: Int, h: Int, stride: Int, sh: Int): ByteArray {
         val o = ByteArray(stride * sh * 3 / 2)
-        for (r in 0 until f.h) System.arraycopy(f.nv12, r * f.w, o, r * stride, f.w)
-        val src = f.w * f.h; val dst = stride * sh
-        for (r in 0 until f.h / 2) System.arraycopy(f.nv12, src + r * f.w, o, dst + r * stride, f.w)
+        for (r in 0 until h) System.arraycopy(raw, r * w, o, r * stride, w)
+        val src = w * h; val dst = stride * sh
+        for (r in 0 until h / 2) System.arraycopy(raw, src + r * w, o, dst + r * stride, w)
         return o
     }
 
-    private fun encode(frames: List<Frame>, out: File, rot: Int) {
-        val fmt = MediaFormat.createVideoFormat("video/avc", frames[0].w, frames[0].h).apply {
+    private fun cropNv12(f: Frame, ox: Int, oy: Int, cw: Int, ch: Int): ByteArray {
+        val out = ByteArray(cw * ch * 3 / 2)
+        for (r in 0 until ch) System.arraycopy(f.nv12, (oy + r) * f.w + ox, out, r * cw, cw)
+        val src = f.w * f.h; val dst = cw * ch
+        for (r in 0 until ch / 2) System.arraycopy(f.nv12, src + (oy / 2 + r) * f.w + ox, out, dst + r * cw, cw)
+        return out
+    }
+
+    // ---- stabilizer digital: gerakan kamera diestimasi lalu jendela potong digeser ----
+    private fun sad(a: IntArray, b: IntArray, sw: Int, sh: Int, dx: Int, dy: Int, step: Int, margin: Int): Long {
+        var s = 0L
+        var y = margin
+        while (y < sh - margin) {
+            var x = margin
+            while (x < sw - margin) { s += Math.abs(a[y * sw + x] - b[(y + dy) * sw + x + dx]); x += step }
+            y += step
+        }
+        return s
+    }
+
+    private fun stabPlan(fr: List<Frame>): Stab? {
+        val w = fr[0].w; val h = fr[0].h
+        if (fr.size < 5 || fr.any { it.w != w || it.h != h }) return null
+        val mx = (w * 0.05).toInt(); val my = (h * 0.05).toInt()
+        val cw = (w - 2 * mx) and 15.inv(); val ch = (h - 2 * my) and 15.inv()
+        val sw = w / 8; val sh = h / 8
+        val sm = fr.map { f -> IntArray(sw * sh) { k -> f.nv12[(k / sw * 8) * w + (k % sw) * 8].toInt() and 255 } }
+        val px = DoubleArray(fr.size); val py = DoubleArray(fr.size)
+        val r4 = 4
+        for (i in 1 until fr.size) {
+            var best = Long.MAX_VALUE; var bx = 0; var by = 0
+            for (dy in -r4..r4) for (dx in -r4..r4) {
+                val s = sad(sm[i - 1], sm[i], sw, sh, dx, dy, 2, r4 + 1)
+                if (s < best) { best = s; bx = dx; by = dy }
+            }
+            px[i] = px[i - 1] + bx; py[i] = py[i - 1] + by
+        }
+        val ox = IntArray(fr.size); val oy = IntArray(fr.size)
+        for (i in fr.indices) {
+            var a = 0.0; var b = 0.0; var n = 0
+            for (k in maxOf(0, i - 6)..minOf(fr.size - 1, i + 6)) { a += px[k]; b += py[k]; n++ }
+            val dx = ((px[i] - a / n) * 8).toInt().coerceIn(-mx, mx)
+            val dy = ((py[i] - b / n) * 8).toInt().coerceIn(-my, my)
+            ox[i] = (mx + dx).coerceIn(0, w - cw) and 1.inv()
+            oy[i] = (my + dy).coerceIn(0, h - ch) and 1.inv()
+        }
+        return Stab(cw, ch, ox, oy)
+    }
+
+    // ---- mode malam: ambil beberapa foto, sejajarkan, rata-ratakan (kurangi noise), angkat bayangan ----
+    private fun takeBitmap(): Bitmap? {
+        val latch = CountDownLatch(1)
+        var bm: Bitmap? = null
+        imageCapture.takePicture(capExec, object : ImageCapture.OnImageCapturedCallback() {
+            override fun onCaptureSuccess(img: ImageProxy) {
+                try {
+                    val b = img.planes[0].buffer
+                    val a = ByteArray(b.remaining()); b.get(a)
+                    val bo = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                    BitmapFactory.decodeByteArray(a, 0, a.size, bo)
+                    var sample = 1
+                    while ((bo.outWidth / sample) * (bo.outHeight / sample) > 6_000_000) sample *= 2
+                    val full = BitmapFactory.decodeByteArray(a, 0, a.size, BitmapFactory.Options().apply { inSampleSize = sample })
+                    val cr = img.cropRect
+                    val l = (cr.left / sample).coerceIn(0, full.width - 2); val t = (cr.top / sample).coerceIn(0, full.height - 2)
+                    val cw = minOf(cr.width() / sample, full.width - l); val ch = minOf(cr.height() / sample, full.height - t)
+                    val m = Matrix().apply { postRotate(img.imageInfo.rotationDegrees.toFloat()) }
+                    bm = Bitmap.createBitmap(full, l, t, cw, ch, m, true)
+                } catch (e: Exception) {
+                } finally { img.close(); latch.countDown() }
+            }
+            override fun onError(e: ImageCaptureException) { latch.countDown() }
+        })
+        latch.await(20, TimeUnit.SECONDS)
+        return bm
+    }
+
+    private fun luma(px: IntArray, w: Int, h: Int, f: Int): IntArray {
+        val sw = w / f; val sh = h / f; val o = IntArray(sw * sh)
+        val st = if (f > 2) 2 else 1
+        val cnt = (f / st) * (f / st)
+        for (y in 0 until sh) for (x in 0 until sw) {
+            var s = 0
+            var j = 0
+            while (j < f) { var i = 0; while (i < f) { val p = px[(y * f + j) * w + x * f + i]; s += (((p shr 16) and 255) + ((p shr 8) and 255) * 2 + (p and 255)) shr 2; i += st }; j += st }
+            o[y * sw + x] = s / cnt
+        }
+        return o
+    }
+
+    private fun align(r8: IntArray, r2: IntArray, f8: IntArray, f2: IntArray, w: Int, h: Int): Pair<Int, Int> {
+        var best = Long.MAX_VALUE; var bx = 0; var by = 0
+        for (dy in -8..8) for (dx in -8..8) {
+            val s = sad(r8, f8, w / 8, h / 8, dx, dy, 2, 9)
+            if (s < best) { best = s; bx = dx; by = dy }
+        }
+        best = Long.MAX_VALUE
+        val cx = bx * 4; val cy = by * 4
+        var rx = cx; var ry = cy
+        for (dy in -4..4) for (dx in -4..4) {
+            val s = sad(r2, f2, w / 2, h / 2, cx + dx, cy + dy, 4, 40)
+            if (s < best) { best = s; rx = cx + dx; ry = cy + dy }
+        }
+        return Pair(rx * 2, ry * 2)
+    }
+
+    private fun accumulate(px: IntArray, w: Int, h: Int, dx: Int, dy: Int, sr: IntArray, sg: IntArray, sb: IntArray, cnt: ByteArray) {
+        for (y in 0 until h) {
+            val fy = y + dy
+            if (fy < 0 || fy >= h) continue
+            for (x in 0 until w) {
+                val fx = x + dx
+                if (fx < 0 || fx >= w) continue
+                val p = px[fy * w + fx]; val i = y * w + x
+                sr[i] += (p shr 16) and 255; sg[i] += (p shr 8) and 255; sb[i] += p and 255; cnt[i]++
+            }
+        }
+    }
+
+    private fun nightStack(n: Int, out: File): Boolean {
+        var rw = 0; var rh = 0
+        var ref: IntArray? = null
+        var r8 = IntArray(0); var r2 = IntArray(0)
+        var sr = IntArray(0); var sg = IntArray(0); var sb = IntArray(0); var cnt = ByteArray(0)
+        for (k in 0 until n) {
+            val bm = takeBitmap() ?: continue
+            if (ref == null) {
+                rw = bm.width; rh = bm.height
+                val first = IntArray(rw * rh); bm.getPixels(first, 0, rw, 0, 0, rw, rh); bm.recycle()
+                ref = first
+                r8 = luma(first, rw, rh, 8); r2 = luma(first, rw, rh, 2)
+                sr = IntArray(rw * rh); sg = IntArray(rw * rh); sb = IntArray(rw * rh); cnt = ByteArray(rw * rh)
+                accumulate(first, rw, rh, 0, 0, sr, sg, sb, cnt)
+                continue
+            }
+            if (bm.width != rw || bm.height != rh) { bm.recycle(); continue }
+            val px = IntArray(rw * rh); bm.getPixels(px, 0, rw, 0, 0, rw, rh); bm.recycle()
+            val (dx, dy) = align(r8, r2, luma(px, rw, rh, 8), luma(px, rw, rh, 2), rw, rh)
+            accumulate(px, rw, rh, dx, dy, sr, sg, sb, cnt)
+        }
+        if (ref == null) return false
+        val lut = IntArray(256) { (255.0 * Math.pow(it / 255.0, 0.8)).toInt().coerceIn(0, 255) }
+        val o = IntArray(rw * rh)
+        for (i in o.indices) {
+            val c = maxOf(1, cnt[i].toInt())
+            o[i] = (0xFF shl 24) or (lut[sr[i] / c] shl 16) or (lut[sg[i] / c] shl 8) or lut[sb[i] / c]
+        }
+        val res = Bitmap.createBitmap(o, rw, rh, Bitmap.Config.ARGB_8888)
+        out.outputStream().use { res.compress(Bitmap.CompressFormat.JPEG, 97, it) }
+        return true
+    }
+
+    private fun encode(frames: List<Frame>, out: File, rot: Int, st: Stab?, hdq: Boolean) {
+        val cw = st?.cw ?: frames[0].w; val ch = st?.ch ?: frames[0].h
+        val fmt = MediaFormat.createVideoFormat("video/avc", cw, ch).apply {
             setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420SemiPlanar)
-            setInteger(MediaFormat.KEY_BIT_RATE, 4_000_000)
+            setInteger(MediaFormat.KEY_BIT_RATE, if (hdq) 8_000_000 else 4_000_000)
             setInteger(MediaFormat.KEY_FRAME_RATE, 30)
             setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
         }
         val codec = MediaCodec.createEncoderByType("video/avc")
         codec.configure(fmt, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE); codec.start()
         val inF = codec.inputFormat
-        val stride = if (inF.containsKey(MediaFormat.KEY_STRIDE)) inF.getInteger(MediaFormat.KEY_STRIDE) else frames[0].w
-        val sh = if (inF.containsKey(MediaFormat.KEY_SLICE_HEIGHT)) inF.getInteger(MediaFormat.KEY_SLICE_HEIGHT) else frames[0].h
+        val stride = if (inF.containsKey(MediaFormat.KEY_STRIDE)) inF.getInteger(MediaFormat.KEY_STRIDE) else cw
+        val sh = if (inF.containsKey(MediaFormat.KEY_SLICE_HEIGHT)) inF.getInteger(MediaFormat.KEY_SLICE_HEIGHT) else ch
         out.delete()
         val mux = MediaMuxer(out.path, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4).apply { setOrientationHint(rot) }
         var track = -1; var started = false
@@ -340,9 +581,10 @@ class MainActivity : ComponentActivity() {
         }
         fun nextInput(): Int { var i: Int; while (codec.dequeueInputBuffer(10_000).also { i = it } < 0) drain(false); return i }
         val t0 = frames[0].tsNs
-        for (f in frames) {
+        for ((n, f) in frames.withIndex()) {
             val i = nextInput()
-            val data = if (stride == f.w && sh == f.h) f.nv12 else pad(f, stride, sh)
+            val raw = if (st != null) cropNv12(f, st.ox[n], st.oy[n], cw, ch) else f.nv12
+            val data = if (stride == cw && sh == ch) raw else pad(raw, cw, ch, stride, sh)
             codec.getInputBuffer(i)!!.apply { clear(); put(data) }
             codec.queueInputBuffer(i, 0, data.size, (f.tsNs - t0) / 1000, 0)
             drain(false)
@@ -355,8 +597,8 @@ class MainActivity : ComponentActivity() {
     private fun saveMotionPhoto(jpg: File, mp4: File, ptsUs: Long, ts: Long): Uri {
         val j = jpg.readBytes(); val v = mp4.readBytes()
         var pos = 2
-        if (j[2] == 0xFF.toByte() && j[3] == 0xE1.toByte())
-            pos = 4 + (((j[4].toInt() and 0xFF) shl 8) or (j[5].toInt() and 0xFF))
+        while (pos + 4 < j.size && j[pos] == 0xFF.toByte() && (j[pos + 1] == 0xE0.toByte() || j[pos + 1] == 0xE1.toByte()))
+            pos += 2 + (((j[pos + 2].toInt() and 0xFF) shl 8) or (j[pos + 3].toInt() and 0xFF))
         val xmp = """<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description rdf:about="" xmlns:GCamera="http://ns.google.com/photos/1.0/camera/" xmlns:Container="http://ns.google.com/photos/1.0/container/" xmlns:Item="http://ns.google.com/photos/1.0/container/item/" GCamera:MotionPhoto="1" GCamera:MotionPhotoVersion="1" GCamera:MotionPhotoPresentationTimestampUs="$ptsUs"><Container:Directory><rdf:Seq><rdf:li rdf:parseType="Resource"><Container:Item Item:Mime="image/jpeg" Item:Semantic="Primary" Item:Length="0" Item:Padding="0"/></rdf:li><rdf:li rdf:parseType="Resource"><Container:Item Item:Mime="video/mp4" Item:Semantic="MotionPhoto" Item:Length="${v.size}" Item:Padding="0"/></rdf:li></rdf:Seq></Container:Directory></rdf:Description></rdf:RDF></x:xmpmeta>"""
         val payload = "http://ns.adobe.com/xap/1.0/\u0000".toByteArray(Charsets.ISO_8859_1) + xmp.toByteArray(Charsets.UTF_8)
         val len = payload.size + 2
