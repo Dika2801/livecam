@@ -276,8 +276,11 @@ class MainActivity : ComponentActivity() {
             val sz = if (wide) (if (hd) Size(1280, 720) else Size(640, 360)) else (if (hd) Size(960, 720) else Size(640, 480))
             val rsAnalysis = ResolutionSelector.Builder().setAspectRatioStrategy(strat)
                 .setResolutionStrategy(ResolutionStrategy(sz, ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER)).build()
+            val capSize = if (wide) Size(3840, 2160) else Size(3264, 2448)
+            val rsCap = ResolutionSelector.Builder().setAspectRatioStrategy(strat)
+                .setResolutionStrategy(ResolutionStrategy(capSize, ResolutionStrategy.FALLBACK_RULE_CLOSEST_LOWER_THEN_HIGHER)).build()
             val pb = Preview.Builder().setResolutionSelector(rs)
-            val icb = ImageCapture.Builder().setResolutionSelector(rs)
+            val icb = ImageCapture.Builder().setResolutionSelector(if (hd || night) rsCap else rs)
                 .setCaptureMode(if (hd || night) ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY else ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
                 .setFlashMode(flashMode)
             val ab = ImageAnalysis.Builder().setResolutionSelector(rsAnalysis).setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
@@ -323,12 +326,12 @@ class MainActivity : ComponentActivity() {
         shutter.isEnabled = false
         inner.animate().scaleX(0.82f).scaleY(0.82f).setDuration(90).withEndAction { inner.animate().scaleX(1f).scaleY(1f).setDuration(90).start() }.start()
         badge("● TAHAN…", Color.parseColor("#FF453A"))
-        if (night) {
-            badge("● TAHAN 5 DETIK", Color.parseColor("#FF453A"))
+        if (night || hd) {
+            badge(if (night) "● TAHAN 6 DETIK" else "● TAHAN 2 DETIK", Color.parseColor("#FF453A"))
             nightExec.execute {
-                val ok = try { nightStack(6, stillFile) } catch (e: Throwable) { false }
+                val ok = try { stackShots(if (night) 6 else 3, night, stillFile) } catch (e: Throwable) { false }
                 if (ok) synchronized(lock) { stillOk = true; maybeFinish() }
-                else { synchronized(lock) { post = null }; reset("Gagal mode malam") }
+                else { synchronized(lock) { post = null }; reset("Gagal memproses foto") }
             }
         } else
         imageCapture.takePicture(ImageCapture.OutputFileOptions.Builder(stillFile).build(), camExec,
@@ -402,7 +405,7 @@ class MainActivity : ComponentActivity() {
         return out
     }
 
-    // ---- stabilizer digital: gerakan kamera diestimasi lalu jendela potong digeser ----
+    // ---- stabilizer digital: estimasi gerak sub-piksel, jalur dihaluskan, jendela potong digeser ----
     private fun sad(a: IntArray, b: IntArray, sw: Int, sh: Int, dx: Int, dy: Int, step: Int, margin: Int): Long {
         var s = 0L
         var y = margin
@@ -414,61 +417,99 @@ class MainActivity : ComponentActivity() {
         return s
     }
 
+    private fun yDown(f: Frame, k: Int): IntArray {
+        val sw = f.w / k; val sh = f.h / k; val o = IntArray(sw * sh)
+        val st = if (k > 2) 2 else 1
+        val cnt = (k / st) * (k / st)
+        for (y in 0 until sh) for (x in 0 until sw) {
+            var s = 0; var j = 0
+            while (j < k) { var i = 0; while (i < k) { s += f.nv12[(y * k + j) * f.w + x * k + i].toInt() and 255; i += st }; j += st }
+            o[y * sw + x] = s / cnt
+        }
+        return o
+    }
+
+    private fun parab(a: Double, b: Double, c: Double): Double {
+        val d = a - 2 * b + c
+        return if (d <= 0.0) 0.0 else ((a - c) / (2 * d)).coerceIn(-0.5, 0.5)
+    }
+
     private fun stabPlan(fr: List<Frame>): Stab? {
         val w = fr[0].w; val h = fr[0].h
         if (fr.size < 5 || fr.any { it.w != w || it.h != h }) return null
-        val mx = (w * 0.05).toInt(); val my = (h * 0.05).toInt()
+        val n = fr.size
+        val mx = (w * 0.08).toInt(); val my = (h * 0.08).toInt()
         val cw = (w - 2 * mx) and 15.inv(); val ch = (h - 2 * my) and 15.inv()
-        val sw = w / 8; val sh = h / 8
-        val sm = fr.map { f -> IntArray(sw * sh) { k -> f.nv12[(k / sw * 8) * w + (k % sw) * 8].toInt() and 255 } }
-        val px = DoubleArray(fr.size); val py = DoubleArray(fr.size)
-        val r4 = 4
-        for (i in 1 until fr.size) {
+        val c8 = fr.map { yDown(it, 8) }; val c2 = fr.map { yDown(it, 2) }
+        val w8 = w / 8; val h8 = h / 8; val w2 = w / 2; val h2 = h / 2
+        val px = DoubleArray(n); val py = DoubleArray(n)
+        for (i in 1 until n) {
             var best = Long.MAX_VALUE; var bx = 0; var by = 0
-            for (dy in -r4..r4) for (dx in -r4..r4) {
-                val s = sad(sm[i - 1], sm[i], sw, sh, dx, dy, 2, r4 + 1)
+            for (dy in -4..4) for (dx in -4..4) {
+                val s = sad(c8[i - 1], c8[i], w8, h8, dx, dy, 1, 5)
                 if (s < best) { best = s; bx = dx; by = dy }
             }
-            px[i] = px[i - 1] + bx; py[i] = py[i - 1] + by
+            val cx = bx * 4; val cy = by * 4
+            var bs = Long.MAX_VALUE; var rx = cx; var ry = cy
+            for (dy in -3..3) for (dx in -3..3) {
+                val s = sad(c2[i - 1], c2[i], w2, h2, cx + dx, cy + dy, 2, 21)
+                if (s < bs) { bs = s; rx = cx + dx; ry = cy + dy }
+            }
+            val s0 = bs.toDouble()
+            val fx = parab(sad(c2[i - 1], c2[i], w2, h2, rx - 1, ry, 2, 21).toDouble(), s0, sad(c2[i - 1], c2[i], w2, h2, rx + 1, ry, 2, 21).toDouble())
+            val fy = parab(sad(c2[i - 1], c2[i], w2, h2, rx, ry - 1, 2, 21).toDouble(), s0, sad(c2[i - 1], c2[i], w2, h2, rx, ry + 1, 2, 21).toDouble())
+            px[i] = px[i - 1] + (rx + fx) * 2; py[i] = py[i - 1] + (ry + fy) * 2
         }
-        val ox = IntArray(fr.size); val oy = IntArray(fr.size)
-        for (i in fr.indices) {
-            var a = 0.0; var b = 0.0; var n = 0
-            for (k in maxOf(0, i - 6)..minOf(fr.size - 1, i + 6)) { a += px[k]; b += py[k]; n++ }
-            val dx = ((px[i] - a / n) * 8).toInt().coerceIn(-mx, mx)
-            val dy = ((py[i] - b / n) * 8).toInt().coerceIn(-my, my)
+        val rad = 10
+        val ox = IntArray(n); val oy = IntArray(n)
+        for (i in 0 until n) {
+            var a = 0.0; var b = 0.0; var ws = 0.0
+            for (k in maxOf(0, i - rad)..minOf(n - 1, i + rad)) {
+                val wt = (rad + 1 - Math.abs(k - i)).toDouble()
+                a += px[k] * wt; b += py[k] * wt; ws += wt
+            }
+            val dx = (px[i] - a / ws).toInt().coerceIn(-mx, mx)
+            val dy = (py[i] - b / ws).toInt().coerceIn(-my, my)
             ox[i] = (mx + dx).coerceIn(0, w - cw) and 1.inv()
             oy[i] = (my + dy).coerceIn(0, h - ch) and 1.inv()
         }
         return Stab(cw, ch, ox, oy)
     }
 
-    // ---- mode malam: ambil beberapa foto, sejajarkan, rata-ratakan (kurangi noise), angkat bayangan ----
-    private fun takeBitmap(): Bitmap? {
+    // ---- foto multi-frame: pilih jepretan tersharp, sejajarkan, rata-ratakan, lalu pertajam ----
+    class Shot(val jpeg: ByteArray, val rot: Int, val cl: Int, val ct: Int, val cw: Int, val ch: Int)
+
+    private fun takeShot(): Shot? {
         val latch = CountDownLatch(1)
-        var bm: Bitmap? = null
+        var shot: Shot? = null
         imageCapture.takePicture(capExec, object : ImageCapture.OnImageCapturedCallback() {
             override fun onCaptureSuccess(img: ImageProxy) {
                 try {
                     val b = img.planes[0].buffer
                     val a = ByteArray(b.remaining()); b.get(a)
-                    val bo = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-                    BitmapFactory.decodeByteArray(a, 0, a.size, bo)
-                    var sample = 1
-                    while ((bo.outWidth / sample) * (bo.outHeight / sample) > 6_000_000) sample *= 2
-                    val full = BitmapFactory.decodeByteArray(a, 0, a.size, BitmapFactory.Options().apply { inSampleSize = sample })
                     val cr = img.cropRect
-                    val l = (cr.left / sample).coerceIn(0, full.width - 2); val t = (cr.top / sample).coerceIn(0, full.height - 2)
-                    val cw = minOf(cr.width() / sample, full.width - l); val ch = minOf(cr.height() / sample, full.height - t)
-                    val m = Matrix().apply { postRotate(img.imageInfo.rotationDegrees.toFloat()) }
-                    bm = Bitmap.createBitmap(full, l, t, cw, ch, m, true)
+                    shot = Shot(a, img.imageInfo.rotationDegrees, cr.left, cr.top, cr.width(), cr.height())
                 } catch (e: Exception) {
                 } finally { img.close(); latch.countDown() }
             }
             override fun onError(e: ImageCaptureException) { latch.countDown() }
         })
         latch.await(20, TimeUnit.SECONDS)
-        return bm
+        return shot
+    }
+
+    private fun decodeShot(s: Shot): Bitmap? {
+        val bo = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeByteArray(s.jpeg, 0, s.jpeg.size, bo)
+        var sample = 1
+        while ((bo.outWidth / sample) * (bo.outHeight / sample) > 9_000_000) sample *= 2
+        val full = BitmapFactory.decodeByteArray(s.jpeg, 0, s.jpeg.size, BitmapFactory.Options().apply { inSampleSize = sample }) ?: return null
+        val l = (s.cl / sample).coerceIn(0, full.width - 2); val t = (s.ct / sample).coerceIn(0, full.height - 2)
+        val cw = minOf(s.cw / sample, full.width - l); val ch = minOf(s.ch / sample, full.height - t)
+        val m = Matrix().apply { postRotate(s.rot.toFloat()) }
+        val r = Bitmap.createBitmap(full, l, t, cw, ch, m, true)
+        if (r !== full) full.recycle()
+        return r
     }
 
     private fun luma(px: IntArray, w: Int, h: Int, f: Int): IntArray {
@@ -476,12 +517,21 @@ class MainActivity : ComponentActivity() {
         val st = if (f > 2) 2 else 1
         val cnt = (f / st) * (f / st)
         for (y in 0 until sh) for (x in 0 until sw) {
-            var s = 0
-            var j = 0
+            var s = 0; var j = 0
             while (j < f) { var i = 0; while (i < f) { val p = px[(y * f + j) * w + x * f + i]; s += (((p shr 16) and 255) + ((p shr 8) and 255) * 2 + (p and 255)) shr 2; i += st }; j += st }
             o[y * sw + x] = s / cnt
         }
         return o
+    }
+
+    private fun sharpness(l: IntArray, w: Int, h: Int): Double {
+        var s = 0L; var n = 0; var y = 1
+        while (y < h - 1) {
+            var x = 1
+            while (x < w - 1) { val i = y * w + x; s += Math.abs(4 * l[i] - l[i - 1] - l[i + 1] - l[i - w] - l[i + w]); n++; x += 2 }
+            y += 2
+        }
+        return s.toDouble() / maxOf(1, n)
     }
 
     private fun align(r8: IntArray, r2: IntArray, f8: IntArray, f2: IntArray, w: Int, h: Int): Pair<Int, Int> {
@@ -500,7 +550,28 @@ class MainActivity : ComponentActivity() {
         return Pair(rx * 2, ry * 2)
     }
 
-    private fun accumulate(px: IntArray, w: Int, h: Int, dx: Int, dy: Int, sr: IntArray, sg: IntArray, sb: IntArray, cnt: ByteArray) {
+    private fun refineFull(ref: IntArray, px: IntArray, w: Int, h: Int, dx: Int, dy: Int): Pair<Int, Int> {
+        val half = minOf(300, w / 4, h / 4)
+        val cx = w / 2; val cy = h / 2
+        var best = Long.MAX_VALUE; var bx = dx; var by = dy
+        for (ey in -2..2) for (ex in -2..2) {
+            var s = 0L
+            var y = cy - half
+            while (y < cy + half) {
+                var x = cx - half
+                while (x < cx + half) {
+                    val xx = x + dx + ex; val yy = y + dy + ey
+                    if (xx >= 0 && xx < w && yy >= 0 && yy < h) s += Math.abs(((ref[y * w + x] shr 8) and 255) - ((px[yy * w + xx] shr 8) and 255))
+                    x += 2
+                }
+                y += 2
+            }
+            if (s < best) { best = s; bx = dx + ex; by = dy + ey }
+        }
+        return Pair(bx, by)
+    }
+
+    private fun accumulate(px: IntArray, w: Int, h: Int, dx: Int, dy: Int, sr: ShortArray, sg: ShortArray, sb: ShortArray, cnt: ByteArray) {
         for (y in 0 until h) {
             val fy = y + dy
             if (fy < 0 || fy >= h) continue
@@ -508,40 +579,122 @@ class MainActivity : ComponentActivity() {
                 val fx = x + dx
                 if (fx < 0 || fx >= w) continue
                 val p = px[fy * w + fx]; val i = y * w + x
-                sr[i] += (p shr 16) and 255; sg[i] += (p shr 8) and 255; sb[i] += p and 255; cnt[i]++
+                sr[i] = (sr[i] + ((p shr 16) and 255)).toShort()
+                sg[i] = (sg[i] + ((p shr 8) and 255)).toShort()
+                sb[i] = (sb[i] + (p and 255)).toShort()
+                cnt[i]++
             }
         }
     }
 
-    private fun nightStack(n: Int, out: File): Boolean {
-        var rw = 0; var rh = 0
-        var ref: IntArray? = null
-        var r8 = IntArray(0); var r2 = IntArray(0)
-        var sr = IntArray(0); var sg = IntArray(0); var sb = IntArray(0); var cnt = ByteArray(0)
-        for (k in 0 until n) {
-            val bm = takeBitmap() ?: continue
-            if (ref == null) {
-                rw = bm.width; rh = bm.height
-                val first = IntArray(rw * rh); bm.getPixels(first, 0, rw, 0, 0, rw, rh); bm.recycle()
-                ref = first
-                r8 = luma(first, rw, rh, 8); r2 = luma(first, rw, rh, 2)
-                sr = IntArray(rw * rh); sg = IntArray(rw * rh); sb = IntArray(rw * rh); cnt = ByteArray(rw * rh)
-                accumulate(first, rw, rh, 0, 0, sr, sg, sb, cnt)
-                continue
-            }
-            if (bm.width != rw || bm.height != rh) { bm.recycle(); continue }
-            val px = IntArray(rw * rh); bm.getPixels(px, 0, rw, 0, 0, rw, rh); bm.recycle()
-            val (dx, dy) = align(r8, r2, luma(px, rw, rh, 8), luma(px, rw, rh, 2), rw, rh)
-            accumulate(px, rw, rh, dx, dy, sr, sg, sb, cnt)
+    private fun boxBlur(src: IntArray, w: Int, h: Int, r: Int): IntArray {
+        val tmp = IntArray(w * h); val out = IntArray(w * h); val d = 2 * r + 1
+        for (y in 0 until h) {
+            val b = y * w; var s = 0
+            for (x in -r..r) s += src[b + x.coerceIn(0, w - 1)]
+            for (x in 0 until w) { tmp[b + x] = s / d; s += src[b + minOf(w - 1, x + r + 1)] - src[b + maxOf(0, x - r)] }
         }
-        if (ref == null) return false
-        val lut = IntArray(256) { (255.0 * Math.pow(it / 255.0, 0.8)).toInt().coerceIn(0, 255) }
-        val o = IntArray(rw * rh)
+        for (x in 0 until w) {
+            var s = 0
+            for (y in -r..r) s += tmp[y.coerceIn(0, h - 1) * w + x]
+            for (y in 0 until h) { out[y * w + x] = s / d; s += tmp[minOf(h - 1, y + r + 1) * w + x] - tmp[maxOf(0, y - r) * w + x] }
+        }
+        return out
+    }
+
+    // kurangi kabut (auto-levels), kontras ringan, warna, lalu pertajam (unsharp mask dengan coring)
+    private fun enhance(p: IntArray, w: Int, h: Int, night: Boolean) {
+        val n = w * h
+        val hist = IntArray(256)
+        var i = 0
+        while (i < n) { val c = p[i]; hist[(((c shr 16) and 255) * 77 + ((c shr 8) and 255) * 150 + (c and 255) * 29) shr 8]++; i += 3 }
+        val total = hist.sum()
+        var acc = 0; var lo = 0; var hi = 255
+        for (v in 0..255) { acc += hist[v]; if (acc >= total * 0.003) { lo = v; break } }
+        acc = 0
+        for (v in 255 downTo 0) { acc += hist[v]; if (acc >= total * 0.003) { hi = v; break } }
+        val lo2 = (lo * 0.6).toInt()
+        val hi2 = (hi + (255 - hi) * 0.25).toInt().coerceAtLeast(lo2 + 160)
+        val amount = if (night) 0.1 else 0.25
+        val gamma = if (night) 0.8 else 1.0
+        val lut = IntArray(256) { v ->
+            var f = ((v - lo2).toDouble() / (hi2 - lo2)).coerceIn(0.0, 1.0)
+            f = Math.pow(f, gamma)
+            f = f * (1 - amount) + f * f * (3 - 2 * f) * amount
+            (f * 255).toInt().coerceIn(0, 255)
+        }
+        val sat = if (night) 1.05 else 1.12
+        val lum = IntArray(n)
+        i = 0
+        while (i < n) {
+            val c = p[i]
+            var r = lut[(c shr 16) and 255]; var g = lut[(c shr 8) and 255]; var b = lut[c and 255]
+            val gr = (r * 77 + g * 150 + b * 29) shr 8
+            r = (gr + (r - gr) * sat).toInt().coerceIn(0, 255)
+            g = (gr + (g - gr) * sat).toInt().coerceIn(0, 255)
+            b = (gr + (b - gr) * sat).toInt().coerceIn(0, 255)
+            p[i] = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
+            lum[i] = (r * 77 + g * 150 + b * 29) shr 8
+            i++
+        }
+        val blur = boxBlur(lum, w, h, 2)
+        val amt = if (night) 0.45 else 0.8
+        i = 0
+        while (i < n) {
+            var d = lum[i] - blur[i]
+            d = if (d > 2) d - 2 else if (d < -2) d + 2 else 0
+            val add = (d * amt).toInt()
+            if (add != 0) {
+                val c = p[i]
+                val r = (((c shr 16) and 255) + add).coerceIn(0, 255)
+                val g = (((c shr 8) and 255) + add).coerceIn(0, 255)
+                val b = ((c and 255) + add).coerceIn(0, 255)
+                p[i] = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
+            }
+            i++
+        }
+    }
+
+    private fun stackShots(n: Int, night: Boolean, out: File): Boolean {
+        val shots = ArrayList<Shot>()
+        for (k in 0 until n) takeShot()?.let { shots.add(it) }
+        if (shots.isEmpty()) return false
+        badge("● MEMPROSES…", yellow)
+        var w = 0; var h = 0
+        val usable = ArrayList<Shot>(); val l8 = ArrayList<IntArray>(); val l2 = ArrayList<IntArray>(); val sc = ArrayList<Double>()
+        for (s in shots) {
+            val bm = decodeShot(s) ?: continue
+            if (w == 0) { w = bm.width; h = bm.height }
+            if (bm.width != w || bm.height != h) { bm.recycle(); continue }
+            val px = IntArray(w * h); bm.getPixels(px, 0, w, 0, 0, w, h); bm.recycle()
+            val a2 = luma(px, w, h, 2)
+            l2.add(a2); l8.add(luma(px, w, h, 8)); sc.add(sharpness(a2, w / 2, h / 2)); usable.add(s)
+        }
+        if (usable.isEmpty()) return false
+        val refI = sc.indices.maxByOrNull { sc[it] }!!
+        val order = listOf(refI) + usable.indices.filter { it != refI && sc[it] >= sc[refI] * 0.7 }
+        val sr = ShortArray(w * h); val sg = ShortArray(w * h); val sb = ShortArray(w * h); val cnt = ByteArray(w * h)
+        var refPx: IntArray? = null
+        for (idx in order) {
+            val bm = decodeShot(usable[idx]) ?: continue
+            val px = IntArray(w * h); bm.getPixels(px, 0, w, 0, 0, w, h); bm.recycle()
+            var dx = 0; var dy = 0
+            if (idx == refI) refPx = px
+            else {
+                val a = align(l8[refI], l2[refI], l8[idx], l2[idx], w, h)
+                val f = refineFull(refPx!!, px, w, h, a.first, a.second)
+                dx = f.first; dy = f.second
+            }
+            accumulate(px, w, h, dx, dy, sr, sg, sb, cnt)
+        }
+        refPx = null
+        val o = IntArray(w * h)
         for (i in o.indices) {
             val c = maxOf(1, cnt[i].toInt())
-            o[i] = (0xFF shl 24) or (lut[sr[i] / c] shl 16) or (lut[sg[i] / c] shl 8) or lut[sb[i] / c]
+            o[i] = (0xFF shl 24) or ((sr[i] / c) shl 16) or ((sg[i] / c) shl 8) or (sb[i] / c)
         }
-        val res = Bitmap.createBitmap(o, rw, rh, Bitmap.Config.ARGB_8888)
+        enhance(o, w, h, night)
+        val res = Bitmap.createBitmap(o, w, h, Bitmap.Config.ARGB_8888)
         out.outputStream().use { res.compress(Bitmap.CompressFormat.JPEG, 97, it) }
         return true
     }
